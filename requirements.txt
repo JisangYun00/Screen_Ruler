@@ -1,0 +1,6 @@
+# 외부 Python 패키지 없음 (표준 라이브러리만 사용).
+# 필요한 시스템 패키지 (Ubuntu):
+#   sudo apt install python3-tk x11-xserver-utils libxext6
+#   - python3-tk        : tkinter
+#   - x11-xserver-utils : xrandr (모니터 위치·EDID 크기)
+#   - libxext6          : X Shape 확장 (기울인 자 모양으로 창 자르기)
