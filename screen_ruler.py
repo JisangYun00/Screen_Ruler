@@ -27,7 +27,11 @@ MARGIN = 2
 GRAB = 30        # 보정 선을 잡을 수 있는 거리 (px)
 MIN_MM = 150     # 버튼이 다 들어가는 최소 길이
 AXIS = {"x": "가로", "y": "세로"}
-SIDE = {"x": ("긴 변", 297), "y": ("짧은 변", 210)}  # A4 를 가로로 눕힌 채 각 축에 대는 변
+# 보정 단계: (축, A4 변 길이 mm, 안내). 축마다 긴 변·짧은 변을 한 번씩, 종이는 한 번만 돌리는 순서
+STEPS = [("x", 297, "A4 를 가로로 눕혀 긴 변 (297 mm)"),
+         ("y", 210, "종이는 그대로 두고 짧은 변 (210 mm)"),
+         ("y", 297, "종이를 세로로 세워 긴 변 (297 mm)"),
+         ("x", 210, "종이는 그대로 두고 짧은 변 (210 mm)")]
 HELP = """화면 자 사용법
 
 [재기]
@@ -47,13 +51,16 @@ HELP = """화면 자 사용법
  · 길이: 끝의 회색 손잡이 드래그, 또는 −1cm / +1cm ([ ])
  · 투명도: + / - 키
 
-[보정] 보정하기 (c) 한 번 → 두 단계를 차례로 (한 번 하면 모니터별로 저장)
- A4 를 가로로 눕힌 채로, 자가 알아서 0° → 90° 로 돈다
- ① 가로 (자 0°): 종이 '긴 변 (297 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
-    파란 선 두 개를 종이 왼쪽·오른쪽 끝에 맞춘 뒤 저장 (Enter)
- ② 세로 (자 90°): 종이 '짧은 변 (210 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
-    파란 선 두 개를 종이 위·아래 끝에 맞춘 뒤 저장 (Enter)
- 한 쪽만 다시 할 때는 다른 단계를 건너뛰기. 끝나면 원래 각도로 돌아감
+[보정] 보정하기 (c) 한 번 → 네 단계를 차례로 (한 번 하면 모니터별로 저장)
+ 자는 알아서 돌고, 각 단계마다 A4 한 변을 자의 눈금 쪽 가장자리에 붙이고
+ 파란 선 두 개를 종이 양 끝에 맞춘 뒤 저장 (Enter)
+ ① 가로 자 (0°)  : A4 를 가로로 눕혀 긴 변 (297 mm)
+ ② 세로 자 (90°) : 종이는 그대로 두고 짧은 변 (210 mm)
+ ③ 세로 자 (90°) : 종이를 세로로 세워 긴 변 (297 mm)
+ ④ 가로 자 (0°)  : 종이는 그대로 두고 짧은 변 (210 mm)
+ 가로·세로 피치 = 두 변 길이 합 ÷ 두 구간 픽셀 합. 두 변 결과 차이(%)로 정확도 확인
+ 필요 없는 단계는 건너뛰기, 화면에 안 들어가는 단계는 자동으로 건너뜀
+ 끝나면 원래 각도로 돌아감
  선 이동: 선 근처를 드래그, 또는 선 클릭 후 방향키로 1 px씩
  자 이동: 선에서 떨어진 곳을 드래그, 또는 선을 고르지 않은 상태에서 방향키
  다른 물체를 쓸 때만 숫자키로 길이(mm) 수정
@@ -109,6 +116,13 @@ def axis_pitch(m, cal, axis):
     if m and m["wmm"] and m["hmm"]:
         return (m["wmm"] / m["w"] if axis == "x" else m["hmm"] / m["h"]), "EDID"
     return 25.4 / 96, "96dpi"
+
+
+def combine(samples):
+    """[(길이 mm, px), ...] → (mm/px, 두 변 결과 차이 % 또는 None). 긴 변에 비례해 무게를 준다."""
+    p = sum(r for r, _ in samples) / sum(d for _, d in samples)
+    each = [r / d for r, d in samples]
+    return p, ((max(each) / min(each) - 1) * 100 if len(each) > 1 else None)
 
 
 def along_pitch(px, py, theta):
@@ -239,9 +253,10 @@ class Ruler:
         self.verify = False  # 검증 모드: A4 길이에 초록 선 표시
         self.hover = None
         self.calib = None    # 보정 중: [u0, u1]
-        self.calib_steps: list = []  # 남은 보정 단계 ("x" → "y")
+        self.calib_steps: list = []  # 남은 보정 단계 (STEPS 의 항목)
         self.calib_theta = 0.0       # 보정 끝나면 돌아갈 각도
-        self.calib_msgs: list = []
+        self.calib_samples: dict = {"x": [], "y": []}  # 축별 (길이 mm, px)
+        self.saved_len: float | None = None  # 보정·검증 때문에 늘리기 전 자 길이
         self.sel: int | None = None  # 보정 중 고른 선 (없으면 방향키로 자를 옮김)
         self.grab_off = 0.0  # 선을 잡은 위치와 선 사이 거리 (드래그 시작 때 선이 튀지 않게)
         self.ref_text = ""
@@ -429,13 +444,12 @@ class Ruler:
             a = self.button(a, "건너뛰기", "skip")
             self.button(a, "취소 (Esc)", "cancel")
             res = f" → {float(self.ref_text) / d:.5f} mm/px" if self.ref_text and d else ""
-            ax = self.calib_steps[0] if self.calib_steps else ax
-            side, ref0 = SIDE.get(ax or "x", SIDE["x"])
+            ax, _, hint = self.calib_steps[0] if self.calib_steps else (ax or "x", 0, "")
             ends = "왼쪽·오른쪽" if ax == "x" else "위·아래"
-            step = 3 - len(self.calib_steps)  # ① 가로 / ② 세로
+            step = len(STEPS) + 1 - len(self.calib_steps)
             msg, until = self.flash
             line1 = msg if time.time() < until else (
-                f"[보정 {step}/2 · {AXIS.get(ax or '', '')}] A4 {side} ({ref0} mm) 을 눈금 쪽에 붙이고, 파란 선 두 개를 종이 {ends} 끝에 맞추기"
+                f"[보정 {step}/{len(STEPS)} · {AXIS[ax]} 자] {hint} 을 눈금 쪽에 붙이고, 파란 선 두 개를 종이 {ends} 끝에 맞추기"
                 f" · 선 근처 드래그: 선 이동 · 다른 곳 드래그: 자 이동 · 방향키: 고른 선 1 px")
             self.text(UI0, r1, line1, fill="#036")
             self.text(UI0, r2, f"길이 {self.ref_text or '?'} mm (A4 아니면 숫자키로 수정) · 선 사이 {d} px{res}",
@@ -559,44 +573,86 @@ class Ruler:
     def resize(self, mm):
         self.update(length_mm=max(MIN_MM, mm))
 
+    def stretch(self, mm):
+        """보정·검증에 필요한 만큼 자를 잠시 늘린다. 끝나면 restore_len 으로 원래 길이."""
+        if self.saved_len is None:
+            self.saved_len = self.length_mm
+        self.resize(mm)
+
+    def restore_len(self):
+        if self.saved_len is not None:
+            mm, self.saved_len = self.saved_len, None
+            self.resize(mm)
+
     def toggle_calib(self):
         if self.calib:
             return self.end_calib()
         self.verify = False
-        self.calib_steps, self.calib_theta, self.calib_msgs = ["x", "y"], self.theta, []
+        self.calib_steps, self.calib_theta = list(STEPS), self.theta
+        self.calib_samples = {"x": [], "y": []}
         self.calib_step()
 
     def calib_step(self):
-        """보정 순서: ① 가로 (자 0°, A4 긴 변 297) → ② 세로 (자 90°, A4 짧은 변 210)."""
-        ax = self.calib_steps[0]
-        self.calib = None
-        self.update(theta=0 if ax == "x" else 90)
-        ref = SIDE[ax][1]
-        if self.f["L"] * self.pitch() < ref + 20:  # 종이 변 전체가 자 위에 오도록
-            self.resize(ref + 20)
-        self.calib, self.ref_text, self.sel = [20, 20 + round(ref / self.pitch())], str(ref), None
+        """지금 단계에 맞게 자를 돌리고 선을 놓는다. 화면에 안 들어가는 단계는 건너뛴다."""
+        while self.calib_steps:
+            ax, ref, _ = self.calib_steps[0]
+            self.calib = None
+            self.update(theta=0 if ax == "x" else 90)
+            if self.f["L"] * self.pitch() < ref + 20:  # 종이 변 전체가 자 위에 오도록
+                self.stretch(ref + 20)
+            if self.f["L"] * self.pitch() >= ref + 8:
+                self.calib, self.ref_text, self.sel = [20, 20 + round(ref / self.pitch())], str(ref), None
+                return
+            self.say(f"{AXIS[ax]} 자로 {ref} mm 는 화면에 안 들어가서 건너뛰었습니다", 6)
+            self.calib_steps.pop(0)
+        self.finish_calib()
 
     def end_calib(self, msg=""):
         self.calib, self.calib_steps = None, []
-        self.update(theta=self.calib_theta)  # 보정 전 각도로 되돌림
+        self.update(theta=self.calib_theta)  # 보정 전 각도·길이로 되돌림
+        self.restore_len()
         if msg:
             self.say(msg, 12)
 
-    def next_calib(self, msg):
+    def next_calib(self, sample=None):
+        """지금 단계를 저장(sample = (길이 mm, px)) 또는 건너뛰고 다음 단계로."""
         if not self.calib_steps:
             return
-        self.calib_steps.pop(0)
-        if msg:
-            self.calib_msgs.append(msg)
+        ax, _, _ = self.calib_steps.pop(0)
         if self.calib_steps:
-            self.say(f"✓ {msg} — 이제 ② 세로: 자가 90° 로 섰습니다" if msg else "② 세로 보정", 6)
-            return self.calib_step()
-        done = " · ".join(self.calib_msgs)
-        self.end_calib(f"✓ 보정 완료 — {done}" if done else "보정을 건너뛰었습니다")
+            nxt_ax, _, nxt = self.calib_steps[0]
+            k = len(STEPS) + 1 - len(self.calib_steps)
+            done = f"✓ {AXIS[ax]} {sample[0]:g} mm = {sample[1]} px → {sample[0] / sample[1]:.5f} mm/px" if sample else "건너뜀"
+            self.say(f"{done} — 다음 {k}/{len(STEPS)}: {AXIS[nxt_ax]} 자, {nxt}", 6)
+        if sample:
+            self.calib_samples[ax].append(sample)
+        self.calib_step()
+
+    def finish_calib(self):
+        """축별로 모은 측정을 합쳐 저장하고 결과를 보여 준다."""
+        m = self.monitor()
+        e = self.cal.setdefault(mon_key(m), {})
+        parts = []
+        for ax in ("x", "y"):
+            samples = self.calib_samples[ax]
+            if not samples:
+                continue
+            p, spread = combine(samples)
+            e[ax] = {"mm_per_px": p, "samples": [{"ref_mm": r, "px": d} for r, d in samples],
+                     "spread_pct": spread, "date": time.strftime("%Y-%m-%d %H:%M")}
+            dev = (p / axis_pitch(m, {}, ax)[0] - 1) * 100
+            s = f"{AXIS[ax]} {p:.5f} mm/px (EDID {dev:+.2f}%"
+            s += f", 두 변 차이 {spread:.2f}%)" if spread is not None else ")"
+            if abs(dev) > 5 or (spread or 0) > 1:  # 보통 둘 다 1% 안쪽. 크면 변을 잘못 대거나 선을 잘못 맞춤
+                s += " ⚠ 다시 보정해 보세요"
+            parts.append(s)
+        if parts:
+            CONF.parent.mkdir(parents=True, exist_ok=True)
+            CONF.write_text(json.dumps(self.cal, indent=2, ensure_ascii=False))
+        self.end_calib("✓ 보정 완료 — " + " · ".join(parts) if parts else "저장한 단계가 없어 보정값을 바꾸지 않았습니다")
 
     def save_calib(self):
-        ax = self.calib_steps[0] if self.calib_steps else None
-        if not self.calib or not ax:
+        if not self.calib or not self.calib_steps:
             return
         d = round(abs(self.calib[1] - self.calib[0]))
         try:
@@ -605,13 +661,7 @@ class Ruler:
             return self.say("종이 길이를 숫자로 입력하세요")
         if d == 0 or ref <= 0:
             return self.say("선 두 개가 겹쳐 있습니다")
-        e = self.cal.setdefault(mon_key(self.monitor()), {})
-        e[ax] = {"mm_per_px": ref / d, "ref_mm": ref, "px": d, "date": time.strftime("%Y-%m-%d %H:%M")}
-        CONF.parent.mkdir(parents=True, exist_ok=True)
-        CONF.write_text(json.dumps(self.cal, indent=2, ensure_ascii=False))
-        dev = (ref / d / axis_pitch(self.monitor(), {}, ax)[0] - 1) * 100
-        warn = f" ⚠ EDID 와 차이가 큽니다: A4 {SIDE[ax][0]} ({SIDE[ax][1]} mm) 에 맞췄는지 확인" if abs(dev) > 5 else ""  # 보통 1% 안쪽
-        self.next_calib(f"{AXIS[ax]} {ref / d:.5f} mm/px (EDID {dev:+.2f}%){warn}")
+        self.next_calib((ref, d))
 
     def help(self):
         t = tk.Toplevel(self.root)
@@ -622,8 +672,10 @@ class Ruler:
 
     def toggle_verify(self):
         self.verify = not self.verify and not self.calib
-        if self.verify and self.f["L"] * self.pitch() < 297 + 15:  # 297 선이 자 위에 오도록
-            self.resize(max(self.length_mm, 297 + 15))
+        if not self.verify:
+            self.restore_len()
+        elif self.f["L"] * self.pitch() < 297 + 15:  # 297 선이 자 위에 오도록
+            self.stretch(297 + 15)
 
     def confirm(self):
         if self.picking() and self.b is not None:
@@ -634,7 +686,7 @@ class Ruler:
         {"cw": lambda: self.rotate(90), "ccw": lambda: self.rotate(-90), "angle": self.ask_angle,
          "fliph": lambda: self.flip("fh"), "flipv": lambda: self.flip("fv"),
          "calib": self.toggle_calib, "save": self.save_calib, "cancel": self.toggle_calib,
-         "skip": lambda: self.next_calib(""),
+         "skip": lambda: self.next_calib(),
          # 화면에 맞춰 줄어 있을 수 있으니 보이는 길이 기준으로 조절
          "shorter": lambda: self.resize(self.f["L"] * self.pitch() - 10),
          "longer": lambda: self.resize(self.f["L"] * self.pitch() + 10),
@@ -734,7 +786,7 @@ class Ruler:
             if self.picking():
                 self.set_a(None)
             elif self.verify:
-                self.verify = False
+                self.toggle_verify()
             elif self.calib:
                 self.end_calib()
             else:
@@ -749,6 +801,9 @@ def selftest():
     assert mon_at(mons, 3900, 10) is mons[1] and mon_at(mons, 100, 100) is None
     cal = {mon_key(mons[0]): {"y": {"mm_per_px": 0.2}}}
     assert axis_pitch(mons[0], cal, "y") == (0.2, "보정") and axis_pitch(mons[0], cal, "x") == (697 / 3840, "EDID")
+    p, spread = combine([(297, 1636), (210, 1157)])
+    assert abs(p - 507 / 2793) < 1e-12 and spread is not None and 0 < spread < 0.1, (p, spread)
+    assert combine([(297, 1636)]) == (297 / 1636, None)
     assert along_pitch(0.1, 0.2, 0) == 0.1 and abs(along_pitch(0.1, 0.2, 90) - 0.2) < 1e-12
     for theta in (0, 30, 90, 135, 200, 270):  # 눈금 좌표 → 창 좌표 → 눈금 좌표 왕복
         for fh in (False, True):
