@@ -24,6 +24,7 @@ THICK = 140      # 자 폭 (px)
 GRIP = 18        # 길이 조절 손잡이 (px)
 UI0 = GRIP + 10  # 버튼·글자 시작 위치 (손잡이와 안 겹치게)
 MARGIN = 2
+GRAB = 30        # 보정 선을 잡을 수 있는 거리 (px)
 MIN_MM = 150     # 버튼이 다 들어가는 최소 길이
 AXIS = {"x": "가로", "y": "세로"}
 SIDE = {"x": ("긴 변", 297), "y": ("짧은 변", 210)}  # A4 를 가로로 눕힌 채 각 축에 대는 변
@@ -53,7 +54,8 @@ HELP = """화면 자 사용법
  ② 세로 (자 90°): 종이 '짧은 변 (210 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
     파란 선 두 개를 종이 위·아래 끝에 맞춘 뒤 저장 (Enter)
  한 쪽만 다시 할 때는 다른 단계를 건너뛰기. 끝나면 원래 각도로 돌아감
- 선 이동: 드래그, 또는 선 클릭 후 방향키로 1 px씩
+ 선 이동: 선 근처를 드래그, 또는 선 클릭 후 방향키로 1 px씩
+ 자 이동: 선에서 떨어진 곳을 드래그, 또는 선을 고르지 않은 상태에서 방향키
  다른 물체를 쓸 때만 숫자키로 길이(mm) 수정
  저장하면 아래 상태줄이 초록 ✓ 로 바뀜
  비스듬한 각도에서는 가로·세로 보정값을 합성해 쓴다
@@ -240,7 +242,8 @@ class Ruler:
         self.calib_steps: list = []  # 남은 보정 단계 ("x" → "y")
         self.calib_theta = 0.0       # 보정 끝나면 돌아갈 각도
         self.calib_msgs: list = []
-        self.sel = 1
+        self.sel: int | None = None  # 보정 중 고른 선 (없으면 방향키로 자를 옮김)
+        self.grab_off = 0.0  # 선을 잡은 위치와 선 사이 거리 (드래그 시작 때 선이 튀지 않게)
         self.ref_text = ""
         self.angle_text: str | None = None  # 각도 입력 중이면 입력한 글자
         self.press: tuple | None = None
@@ -433,7 +436,7 @@ class Ruler:
             msg, until = self.flash
             line1 = msg if time.time() < until else (
                 f"[보정 {step}/2 · {AXIS.get(ax or '', '')}] A4 {side} ({ref0} mm) 을 눈금 쪽에 붙이고, 파란 선 두 개를 종이 {ends} 끝에 맞추기"
-                f" (드래그 / 선 클릭 후 방향키 1 px)")
+                f" · 선 근처 드래그: 선 이동 · 다른 곳 드래그: 자 이동 · 방향키: 고른 선 1 px")
             self.text(UI0, r1, line1, fill="#036")
             self.text(UI0, r2, f"길이 {self.ref_text or '?'} mm (A4 아니면 숫자키로 수정) · 선 사이 {d} px{res}",
                       fill="#036", font=bold)
@@ -571,7 +574,7 @@ class Ruler:
         ref = SIDE[ax][1]
         if self.f["L"] * self.pitch() < ref + 20:  # 종이 변 전체가 자 위에 오도록
             self.resize(ref + 20)
-        self.calib, self.ref_text, self.sel = [20, 20 + round(ref / self.pitch())], str(ref), 1
+        self.calib, self.ref_text, self.sel = [20, 20 + round(ref / self.pitch())], str(ref), None
 
     def end_calib(self, msg=""):
         self.calib, self.calib_steps = None, []
@@ -651,13 +654,15 @@ class Ruler:
         if btn:
             self.press = None
             return self.act(btn)
-        mode = "grip" if "grip" in tags else "calib" if self.calib else "move"
-        self.press = (mode, e.x_root, e.y_root, self.wx, self.wy, False)
-        if mode == "calib" and self.calib:
+        mode = "grip" if "grip" in tags else "move"
+        if mode == "move" and self.calib:  # 선 근처면 선을, 아니면 자를 옮긴다
             u = self.u_of(e)
-            self.sel = 0 if abs(u - self.calib[0]) < abs(u - self.calib[1]) else 1
-            self.calib[self.sel] = round(u)
+            i = 0 if abs(u - self.calib[0]) < abs(u - self.calib[1]) else 1
+            self.sel = i if abs(u - self.calib[i]) <= GRAB else None
+            if self.sel is not None:
+                mode, self.grab_off = "calib", self.calib[i] - u
             self.redraw_dyn()
+        self.press = (mode, e.x_root, e.y_root, self.wx, self.wy, False)
 
     def on_drag(self, e):
         if not self.press:
@@ -666,8 +671,8 @@ class Ruler:
         if mode == "grip":
             self.grip_mm = self.u_of(e) * self.pitch()
             self.later("grip", lambda: self.resize(self.grip_mm))
-        elif mode == "calib" and self.calib:
-            self.calib[self.sel] = round(self.u_of(e))
+        elif mode == "calib" and self.calib and self.sel is not None:
+            self.calib[self.sel] = round(self.u_of(e) + self.grab_off)
             self.redraw_dyn()
         else:
             dx, dy = e.x_root - x0, e.y_root - y0
@@ -680,6 +685,8 @@ class Ruler:
         if self.press and self.press[0] == "move":
             if self.press[5]:
                 self.update()  # 다른 모니터로 옮겼으면 피치가 바뀐다
+            elif self.calib:  # 보정 중 클릭은 측정점을 찍지 않는다
+                pass
             elif self.a is None:
                 self.set_a(self.u_of(e))
             elif not self.done:  # 확정 전에는 클릭할 때마다 B 만 다시 찍는다
@@ -695,7 +702,7 @@ class Ruler:
         step = {"Left": -1, "Up": -1, "Right": 1, "Down": 1}.get(k)
         if step:
             step *= 10 if shift else 1
-            if self.calib:
+            if self.calib and self.sel is not None:
                 self.calib[self.sel] += step
             elif self.picking() and self.b is not None:
                 self.b += step
