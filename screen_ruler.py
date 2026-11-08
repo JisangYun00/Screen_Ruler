@@ -196,7 +196,8 @@ class _XRect(ctypes.Structure):
 
 
 class Shaper:
-    """창 모양을 기울어진 자 모양으로 잘라, 바깥 모서리는 아래 창이 보이고 클릭도 통과하게 한다 (libXext)."""
+    """창 모양을 기울어진 자 모양으로 잘라, 바깥 모서리는 아래 창이 보이고 클릭도 통과하게 한다 (libXext).
+    테두리 없는 창의 키보드 포커스도 여기서 X 에 직접 요청한다."""
 
     def __init__(self):
         try:
@@ -211,6 +212,7 @@ class Shaper:
         self.x11.XFree.argtypes = [ctypes.c_void_p]
         self.x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.POINTER(ctypes.c_ulong)] * 2 + \
                                        [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint)]
+        self.x11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
         self.ext.XShapeCombineRectangles.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
                                                      ctypes.c_int, ctypes.POINTER(_XRect), ctypes.c_int,
                                                      ctypes.c_int, ctypes.c_int]
@@ -237,6 +239,12 @@ class Shaper:
             for kind in (0, 2):  # ShapeBounding, ShapeInput
                 self.ext.XShapeCombineRectangles(self.dpy, w, kind, 0, 0, arr, len(rects), 0, 0)  # ShapeSet, Unsorted
         self.x11.XFlush(self.dpy)
+
+    def focus(self, win):
+        """overrideredirect 창은 창 관리자가 포커스를 안 주고 Tk 의 focus -force 도 안 먹는다."""
+        if self.dpy:
+            self.x11.XSetInputFocus(self.dpy, win, 1, 0)  # RevertToPointerRoot, CurrentTime
+            self.x11.XFlush(self.dpy)
 
 
 class Ruler:
@@ -270,6 +278,8 @@ class Ruler:
         self.grip_mm = 0.0
         self.widths = {}     # 버튼 글자 폭 캐시: font.measure 가 한글·기호 대체 글꼴 때문에 호출당 ~10 ms
         self.alpha = 0.85
+        # ibus 같은 입력기(XIM)가 켜져 있으면 Tk 로 가는 키를 삼킨다. 자에서는 한글 입력이 필요 없다
+        root.tk.call("tk", "useinputmethods", 0)
         root.overrideredirect(True)
         root.attributes("-topmost", True)
         root.attributes("-alpha", self.alpha)
@@ -700,7 +710,8 @@ class Ruler:
         self.set_hover(self.u_of(e))
 
     def on_press(self, e):
-        self.root.focus_force()  # overrideredirect 창은 WM 이 포커스를 안 준다
+        self.shaper.focus(int(self.root.wm_frame(), 16))  # 단축키가 먹도록 X 포커스 + Tk 포커스
+        self.root.focus_force()
         hit = self.c.find_withtag("current")
         tags = self.c.gettags(hit[0]) if hit else ()
         btn = next((t[4:] for t in tags if t.startswith("btn:")), None)
