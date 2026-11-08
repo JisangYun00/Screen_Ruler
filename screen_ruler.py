@@ -46,13 +46,13 @@ HELP = """화면 자 사용법
  · 길이: 끝의 회색 손잡이 드래그, 또는 −1cm / +1cm ([ ])
  · 투명도: + / - 키
 
-[보정] A4 를 가로로 눕힌 채로 두 번 (한 번 하면 모니터별로 저장)
- ① 가로 보정: 자 0° (가로) → 보정하기 (c)
-    종이 '긴 변 (297 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
+[보정] 보정하기 (c) 한 번 → 두 단계를 차례로 (한 번 하면 모니터별로 저장)
+ A4 를 가로로 눕힌 채로, 자가 알아서 0° → 90° 로 돈다
+ ① 가로 (자 0°): 종이 '긴 변 (297 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
     파란 선 두 개를 종이 왼쪽·오른쪽 끝에 맞춘 뒤 저장 (Enter)
- ② 세로 보정: ↻90° 로 자를 세움 → 보정하기 (c)
-    종이 '짧은 변 (210 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
+ ② 세로 (자 90°): 종이 '짧은 변 (210 mm)' 을 자의 눈금 쪽 가장자리에 붙이고
     파란 선 두 개를 종이 위·아래 끝에 맞춘 뒤 저장 (Enter)
+ 한 쪽만 다시 할 때는 다른 단계를 건너뛰기. 끝나면 원래 각도로 돌아감
  선 이동: 드래그, 또는 선 클릭 후 방향키로 1 px씩
  다른 물체를 쓸 때만 숫자키로 길이(mm) 수정
  저장하면 아래 상태줄이 초록 ✓ 로 바뀜
@@ -237,6 +237,9 @@ class Ruler:
         self.verify = False  # 검증 모드: A4 길이에 초록 선 표시
         self.hover = None
         self.calib = None    # 보정 중: [u0, u1]
+        self.calib_steps: list = []  # 남은 보정 단계 ("x" → "y")
+        self.calib_theta = 0.0       # 보정 끝나면 돌아갈 각도
+        self.calib_msgs: list = []
         self.sel = 1
         self.ref_text = ""
         self.angle_text: str | None = None  # 각도 입력 중이면 입력한 글자
@@ -420,12 +423,18 @@ class Ruler:
                 self.tick_line(v, 0, THICK, fill="red" if i == self.sel else "blue", width=2, tags="dyn")
             d = round(abs(self.calib[1] - self.calib[0]))
             a = self.button(UI0, "저장 (Enter)", "save", "#d8f5d0")
+            a = self.button(a, "건너뛰기", "skip")
             self.button(a, "취소 (Esc)", "cancel")
             res = f" → {float(self.ref_text) / d:.5f} mm/px" if self.ref_text and d else ""
+            ax = self.calib_steps[0] if self.calib_steps else ax
             side, ref0 = SIDE.get(ax or "x", SIDE["x"])
             ends = "왼쪽·오른쪽" if ax == "x" else "위·아래"
-            self.text(UI0, r1, f"[{AXIS.get(ax or '', '')} 보정] A4 {side} ({ref0} mm) 을 눈금 쪽에 붙이고, 파란 선 두 개를 종이 {ends} 끝에 맞추기"
-                               f" (드래그 / 선 클릭 후 방향키 1 px)", fill="#036")
+            step = 3 - len(self.calib_steps)  # ① 가로 / ② 세로
+            msg, until = self.flash
+            line1 = msg if time.time() < until else (
+                f"[보정 {step}/2 · {AXIS.get(ax or '', '')}] A4 {side} ({ref0} mm) 을 눈금 쪽에 붙이고, 파란 선 두 개를 종이 {ends} 끝에 맞추기"
+                f" (드래그 / 선 클릭 후 방향키 1 px)")
+            self.text(UI0, r1, line1, fill="#036")
             self.text(UI0, r2, f"길이 {self.ref_text or '?'} mm (A4 아니면 숫자키로 수정) · 선 사이 {d} px{res}",
                       fill="#036", font=bold)
             return
@@ -539,7 +548,9 @@ class Ruler:
             self.angle_text = None
 
     def flip(self, attr):
-        self.calib, self.a, self.b = None, None, None
+        if self.calib:  # 보정 중에는 각도·방향을 바꾸지 않는다
+            return
+        self.a, self.b = None, None
         self.update(keep="center", **{attr: not getattr(self, attr)})
 
     def resize(self, mm):
@@ -547,19 +558,41 @@ class Ruler:
 
     def toggle_calib(self):
         if self.calib:
-            self.calib = None
-            return
+            return self.end_calib()
         self.verify = False
-        ax = self.calib_axis()
-        if not ax:
-            return self.say("보정은 0° / 90° / 180° / 270° 에서만 됩니다 — ↺90° / ↻90° 나 각도… 로 맞춰 주세요")
+        self.calib_steps, self.calib_theta, self.calib_msgs = ["x", "y"], self.theta, []
+        self.calib_step()
+
+    def calib_step(self):
+        """보정 순서: ① 가로 (자 0°, A4 긴 변 297) → ② 세로 (자 90°, A4 짧은 변 210)."""
+        ax = self.calib_steps[0]
+        self.calib = None
+        self.update(theta=0 if ax == "x" else 90)
         ref = SIDE[ax][1]
-        if self.length_mm < ref + 20:  # 종이 변 전체가 자 위에 오도록
+        if self.f["L"] * self.pitch() < ref + 20:  # 종이 변 전체가 자 위에 오도록
             self.resize(ref + 20)
         self.calib, self.ref_text, self.sel = [20, 20 + round(ref / self.pitch())], str(ref), 1
 
+    def end_calib(self, msg=""):
+        self.calib, self.calib_steps = None, []
+        self.update(theta=self.calib_theta)  # 보정 전 각도로 되돌림
+        if msg:
+            self.say(msg, 12)
+
+    def next_calib(self, msg):
+        if not self.calib_steps:
+            return
+        self.calib_steps.pop(0)
+        if msg:
+            self.calib_msgs.append(msg)
+        if self.calib_steps:
+            self.say(f"✓ {msg} — 이제 ② 세로: 자가 90° 로 섰습니다" if msg else "② 세로 보정", 6)
+            return self.calib_step()
+        done = " · ".join(self.calib_msgs)
+        self.end_calib(f"✓ 보정 완료 — {done}" if done else "보정을 건너뛰었습니다")
+
     def save_calib(self):
-        ax = self.calib_axis()
+        ax = self.calib_steps[0] if self.calib_steps else None
         if not self.calib or not ax:
             return
         d = round(abs(self.calib[1] - self.calib[0]))
@@ -573,14 +606,9 @@ class Ruler:
         e[ax] = {"mm_per_px": ref / d, "ref_mm": ref, "px": d, "date": time.strftime("%Y-%m-%d %H:%M")}
         CONF.parent.mkdir(parents=True, exist_ok=True)
         CONF.write_text(json.dumps(self.cal, indent=2, ensure_ascii=False))
-        self.calib = None
-        other = "y" if ax == "x" else "x"
-        nxt = "" if other in e else f" — 이제 ↻90° 로 돌려서 {AXIS[other]} 보정 (A4 {SIDE[other][0]} {SIDE[other][1]} mm)"
         dev = (ref / d / axis_pitch(self.monitor(), {}, ax)[0] - 1) * 100
-        if abs(dev) > 5:  # 보통 1% 안쪽. 크게 어긋나면 종이 방향·길이 입력 실수
-            nxt = f" — ⚠ EDID 와 {dev:+.1f}% 차이: {AXIS[ax]} 보정은 A4 {SIDE[ax][0]} ({SIDE[ax][1]} mm) 에 맞췄는지 확인하세요"
-        self.say(f"✓ {AXIS[ax]} 보정 저장 완료: {ref / d:.5f} mm/px{nxt}", 10)
-        self.update()  # 새 피치로 길이 다시 맞춤
+        warn = f" ⚠ EDID 와 차이가 큽니다: A4 {SIDE[ax][0]} ({SIDE[ax][1]} mm) 에 맞췄는지 확인" if abs(dev) > 5 else ""  # 보통 1% 안쪽
+        self.next_calib(f"{AXIS[ax]} {ref / d:.5f} mm/px (EDID {dev:+.2f}%){warn}")
 
     def help(self):
         t = tk.Toplevel(self.root)
@@ -603,7 +631,10 @@ class Ruler:
         {"cw": lambda: self.rotate(90), "ccw": lambda: self.rotate(-90), "angle": self.ask_angle,
          "fliph": lambda: self.flip("fh"), "flipv": lambda: self.flip("fv"),
          "calib": self.toggle_calib, "save": self.save_calib, "cancel": self.toggle_calib,
-         "shorter": lambda: self.resize(self.length_mm - 10), "longer": lambda: self.resize(self.length_mm + 10),
+         "skip": lambda: self.next_calib(""),
+         # 화면에 맞춰 줄어 있을 수 있으니 보이는 길이 기준으로 조절
+         "shorter": lambda: self.resize(self.f["L"] * self.pitch() - 10),
+         "longer": lambda: self.resize(self.f["L"] * self.pitch() + 10),
          "verify": self.toggle_verify, "measure": lambda: self.set_a(None), "confirm": self.confirm, "help": self.help, "quit": self.root.destroy}[name]()
         if name != "quit":
             self.redraw_dyn()
@@ -697,9 +728,10 @@ class Ruler:
                 self.set_a(None)
             elif self.verify:
                 self.verify = False
-            elif not self.calib:
+            elif self.calib:
+                self.end_calib()
+            else:
                 return self.root.destroy()
-            self.calib = None
         self.redraw_dyn()
 
 
